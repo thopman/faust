@@ -50,8 +50,8 @@ class circleAudio : public audio {
         int iNumOutputs;
     
         // Faust convention for input/output arrays
-        FAUSTFLOAT *inputsArray[8];
-        FAUSTFLOAT *outputsArray[8];
+        FAUSTFLOAT *inputsArray[2];
+        FAUSTFLOAT *outputsArray[2];
 
     public:
     

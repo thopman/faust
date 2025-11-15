@@ -27,6 +27,7 @@ NVOICES="0"
 #PACKAGENAME="0"
 POLY2="0"
 MIDI="0"
+OSC="0"
 NODOC="0"
 EFFECT=""
 
@@ -36,7 +37,8 @@ echoHelp()
     platform "Raspberry Pi"
     echo "Generates inline Faust objects for Raspberry Pi Circle"
     option
-    option -midi
+    option -midi "Enable MIDI control"
+    option -osc "Enable OSC control (bare metal)"
     option "-nvoices <num>"
     option "-effect <effect.dsp>"
     option "Faust options"
@@ -64,6 +66,9 @@ createAPI ()
     if [ "$MIDI" = "1" ]; then
         echo "#define MIDICTRL 1" | cat - "$APIFOLDER/circleFaustDSP.cpp" > temp && mv temp "$APIFOLDER/circleFaustDSP.cpp"
     fi
+    if [ "$OSC" = "1" ]; then
+        echo "#define OSCCTRL 1" | cat - "$APIFOLDER/circleFaustDSP.cpp" > temp && mv temp "$APIFOLDER/circleFaustDSP.cpp"
+    fi
 }
 
 # dispatch command arguments
@@ -83,6 +88,8 @@ do
         EFFECT=$1
     elif [ "$p" = "-midi" ]; then
         MIDI="1"
+    elif [ "$p" = "-osc" ]; then
+        OSC="1"
     elif [ $p = "-nvoices" ]; then
         shift
         NVOICES=$1
