@@ -118,14 +118,31 @@ void circleFaustDSP::propagateMidi(int count, double time, int type, int channel
 
 #ifdef OSCCTRL
 
-void circleFaustDSP::setOSCNetwork(CSocket* socket, CNetSubSystem* net)
+void circleFaustDSP::setOSCNetwork(CNetSubSystem* net,
+                                    int inputPort,
+                                    int outputPort,
+                                    int errorPort)
 {
-    if (!fOSCUI && socket && net) {
-        // Create OSCUI instance with network components
-        fOSCUI = new OSCUI_circle("faust", socket, net);
+    if (!fOSCUI && net) {
+        // Create OSCUI instance with network subsystem
+        fOSCUI = new OSCUI_circle("faust", net);
 
-        // Build the UI - this registers all parameters with OSCUI
-        fPolyEngine->buildUserInterface(fOSCUI);
+        // Initialize network with standard OSC ports
+        if (fOSCUI->initNetwork(inputPort, outputPort, errorPort)) {
+            // Build the UI - this registers all parameters with OSCUI
+            fPolyEngine->buildUserInterface(fOSCUI);
+        } else {
+            // Network initialization failed
+            delete fOSCUI;
+            fOSCUI = nullptr;
+        }
+    }
+}
+
+void circleFaustDSP::setOSCTimer(CTimer* timer)
+{
+    if (fOSCUI) {
+        fOSCUI->setTimer(timer);
     }
 }
 

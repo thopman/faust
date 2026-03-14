@@ -21,135 +21,154 @@
  architecture section is not modified.
  ************************************************************************/
 
-#include <math.h>
-#include <cmath>
+#ifndef __circle_faust_dsp__
+#define __circle_faust_dsp__
 
-#include "faust/misc.h"
-#include "faust/gui/UI.h"
-#include "faust/dsp/dsp.h"
-#include "faust/dsp/dsp-adapter.h"
-#include "faust/gui/meta.h"
+//==========================================
 
-//**************************************************************
-// Intrinsic
-//**************************************************************
+#define CIRCLE_SAMPLERATE AUDIO_SAMPLE_RATE
 
-<<includeIntrinsic>>
-
-<<includeclass>>
-
-//**************************************************************
-// Polyphony
-//**************************************************************
-
-#include "faust/dsp/faust-poly-engine.h"
-
-//**************************************************************
-// Audio driver
-//**************************************************************
-
-#include "faust/audio/circleAudio.h"
-
-//**************************************************************
-// OSC Support (optional)
-//**************************************************************
+// Forward declarations
+class FaustPolyEngine;
+class MidiUI;
+class circleAudio;
+class mydsp;
 
 #ifdef OSCCTRL
-#include "faust/gui/OSCUI_circle.h"
+class OSCUI_circle;
+class CNetSubSystem;
+class CTimer;
 #endif
 
-//**************************************************************
-// Interface
-//**************************************************************
+#ifndef FAUSTFLOAT
+#define FAUSTFLOAT float
+#endif
 
-#include "circleFaustDSP.h"
-
-std::list<GUI*> GUI::fGuiList;
-ztimedmap GUI::gTimedZoneMap;
-
-// constructor
-circleFaustDSP::circleFaustDSP(int sampleRate, int bufferSize, int numInputs, int numOutputs)
+class circleFaustDSP
 {
-    // create a new instance of the audio driver.
-    fAudioDriver = new circleAudio(sampleRate, bufferSize, numInputs, numOutputs);
 
-    // create a new instance of the FaustPolyEngine, the constructor calls DSP init
-    fPolyEngine = new FaustPolyEngine(new mydsp(), fAudioDriver);
+    private:
 
-    #ifdef OSCCTRL
-    // OSC UI will be initialized later via setOSCNetwork()
-    fOSCUI = nullptr;
-    #endif
-}
+        // the polyphonic engine
+        FaustPolyEngine* fPolyEngine;
 
-// destructor
-circleFaustDSP::~circleFaustDSP()
-{
-    #ifdef OSCCTRL
-    delete fOSCUI;
-    #endif
+        // the audio driver
+        circleAudio* fAudioDriver;
 
-    // DSP and fAudioDriver are kept and deleted by fPolyEngine
-    delete fPolyEngine;
-}
+        #ifdef OSCCTRL
+        // OSC UI (optional)
+        OSCUI_circle* fOSCUI;
+        #endif
 
-// setup the sampleRate and bufferSize
-// void setDSP_Parameters(int sampleRate, int bufferSize);
-void circleFaustDSP::setDSP_ChannelBuffers(FAUSTFLOAT *AudioChannelA_0_Left, FAUSTFLOAT *AudioChannelA_0_Right,
-                                            FAUSTFLOAT *AudioChannelB_0_Left, FAUSTFLOAT *AudioChannelB_0_Right)
-{
-    fAudioDriver->setDSP_ChannelBuffers(AudioChannelA_0_Left, AudioChannelA_0_Right, AudioChannelB_0_Left, AudioChannelB_0_Right);
-}
+    public:
 
-void circleFaustDSP::processAudioCallback()
-{
-    // ask the driver to process the audio callback
-    fAudioDriver->processAudioCallback();
-}
+        //--------------`circleFaustDSP()`----------------
+        // Default constructor, the audio driver will set
+        // the sampleRate and buffer size
+        //----
+        circleFaustDSP(int sampleRate, int bufferSize, int numInputs, int numOutputs);
 
-void circleFaustDSP::propagateMidi(int count, double time, int type, int channel, int data1, int data2)
-{
-    fPolyEngine->propagateMidi(count, time, type, channel, data1, data2);
-}
+        // destructor
+        ~circleFaustDSP();
 
-//**************************************************************
-// OSC Methods
-//**************************************************************
+        // setup the the hardware buffer pointers.
+        void setDSP_ChannelBuffers(FAUSTFLOAT *AudioChannelA_0_Left, FAUSTFLOAT *AudioChannelA_0_Right,
+                                    FAUSTFLOAT *AudioChannelB_0_Left, FAUSTFLOAT *AudioChannelB_0_Right);
 
-#ifdef OSCCTRL
+        //-----------------`void processAudioCallback()`--------------------------
+        // Callback to render a buffer.
+        //--------------------------------------------------------
+        void processAudioCallback();
 
-void circleFaustDSP::setOSCNetwork(CSocket* socket, CNetSubSystem* net)
-{
-    if (!fOSCUI && socket && net) {
-        // Create OSCUI instance with network components
-        fOSCUI = new OSCUI_circle("faust", socket, net);
+        //-------`void propagateMidi(int count, double time, int type, int channel, int data1, int data2)`--------
+        // Take a raw MIDI message and propagate it to the Faust
+        // DSP object. This method can be used concurrently with
+        // [`keyOn`](#keyOn) and [`keyOff`](#keyOff).
+        //
+        // `propagateMidi` can
+        // only be used if the `[style:poly]` metadata is used in
+        // the Faust code or if `-nvoices` flag has been
+        // provided before compilation.
+        //
+        // #### Arguments
+        //
+        // * `count`: size of the message (1-3)
+        // * `time`: time stamp
+        // * `type`: message type (byte)
+        // * `channel`: channel number
+        // * `data1`: first data byte (should be `null` if `count<2`)
+        // * `data2`: second data byte (should be `null` if `count<3`)
+        //--------------------------------------------------------
+        void propagateMidi(int, double, int, int, int, int);
 
-        // Build the UI - this registers all parameters with OSCUI
-        fPolyEngine->buildUserInterface(fOSCUI);
-    }
-}
+        #ifdef OSCCTRL
+        //-------`void setOSCNetwork(CNetSubSystem* net, int inputPort, int outputPort, int errorPort)`--------
+        // Initialize OSC support with Circle network subsystem.
+        // Creates 3 UDP sockets for standard OSC communication:
+        //   - inputPort (default 5510): receives parameter updates
+        //   - outputPort (default 5511): sends bargraph values
+        //   - errorPort (default 5512): sends error messages
+        //
+        // Must be called before processOSC(). Network initialization
+        // may fail if ports are already in use.
+        //
+        // #### Arguments
+        //
+        // * `net`: Pointer to Circle CNetSubSystem (must be initialized)
+        // * `inputPort`: UDP port for receiving OSC messages (default: 5510)
+        // * `outputPort`: UDP port for sending bargraphs (default: 5511)
+        // * `errorPort`: UDP port for error messages (default: 5512)
+        //--------------------------------------------------------
+        void setOSCNetwork(CNetSubSystem* net,
+                          int inputPort = 5510,
+                          int outputPort = 5511,
+                          int errorPort = 5512);
 
-void circleFaustDSP::processOSC()
-{
-    if (fOSCUI) {
-        fOSCUI->processOSC();
-    }
-}
+        //-------`void setOSCTimer(CTimer* timer)`--------
+        // Set timer for bargraph rate limiting (Phase 2).
+        // Required for bargraph output functionality.
+        //
+        // #### Arguments
+        //
+        // * `timer`: Pointer to Circle CTimer
+        //--------------------------------------------------------
+        void setOSCTimer(CTimer* timer);
 
-int circleFaustDSP::getOSCParamsCount()
-{
-    if (fOSCUI) {
-        return fOSCUI->getParamsCount();
-    }
-    return 0;
-}
+        //-------`void processOSC()`--------
+        // Process incoming OSC messages (non-blocking).
+        // Call this regularly from main loop (e.g., every 1ms).
+        // Never call from audio callback.
+        //
+        // Handles:
+        // - Parameter updates (floats, ints, doubles)
+        // - OSC bundles
+        // - Discovery messages (/get, /hello)
+        // - Bargraph transmission (rate-limited)
+        //--------------------------------------------------------
+        void processOSC();
 
-const char* circleFaustDSP::getOSCParamAddress(int index)
-{
-    if (fOSCUI) {
-        return fOSCUI->getParamAddress(index);
-    }
-    return nullptr;
-}
+        //-------`int getOSCParamsCount()`--------
+        // Get total number of OSC-controllable parameters.
+        //
+        // #### Returns
+        //
+        // Number of parameters (sliders, buttons, etc.)
+        //--------------------------------------------------------
+        int getOSCParamsCount();
 
-#endif // OSCCTRL
+        //-------`const char* getOSCParamAddress(int index)`--------
+        // Get OSC address for parameter at given index.
+        //
+        // #### Arguments
+        //
+        // * `index`: Parameter index (0 to getOSCParamsCount()-1)
+        //
+        // #### Returns
+        //
+        // OSC address string (e.g., "/faust/synth/volume") or nullptr
+        //--------------------------------------------------------
+        const char* getOSCParamAddress(int index);
+        #endif // OSCCTRL
+};
+
+#endif
