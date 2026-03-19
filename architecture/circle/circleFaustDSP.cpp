@@ -146,11 +146,12 @@ void circleFaustDSP::setOSCTimer(CTimer* timer)
     }
 }
 
-void circleFaustDSP::processOSC()
+bool circleFaustDSP::processOSC()
 {
     if (fOSCUI) {
-        fOSCUI->processOSC();
+        return fOSCUI->processOSC();
     }
+    return false;
 }
 
 int circleFaustDSP::getOSCParamsCount()

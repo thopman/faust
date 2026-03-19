@@ -64,11 +64,13 @@
 #include "faust/gui/UI.h"
 #include "faust/gui/PathBuilder.h"
 
-// Forward declarations for Circle types (provided by user's Circle project)
+// Forward declarations for Circle pointer types
 class CSocket;
 class CNetSubSystem;
-class CIPAddress;
 class CTimer;
+
+// Full include needed: CIPAddress is a value member (not a pointer)
+#include <circle/net/ipaddress.h>
 
 // Include tinyosc via Circle wrapper
 #ifdef OSCCTRL
@@ -141,20 +143,19 @@ public:
 
 class CircleOSCNetwork {
 private:
-    CSocket* fInputSocket;     // Port 5510 - receive parameter updates
-    CSocket* fOutputSocket;    // Port 5511 - send bargraphs
-    CSocket* fErrorSocket;     // Port 5512 - send errors
+    // Single bound socket — Circle requires Bind() before SendTo() works.
+    // Input and output both go through this socket (same pattern as network_test).
+    CSocket* fSocket;          // Bound to 5510: receives on 5510, sends to remote:5511/5512
     CNetSubSystem* fNet;
 
-    // Sender tracking for responses
-    CIPAddress fLastSenderIP;
-    unsigned short fLastSenderPort;
+    // Destination tracking (set from first received packet, per Faust desthost model)
+    CIPAddress fDestHost;
+    int fOutputPort;
+    int fErrPort;
     bool fHasValidSender;
 
-    // Pre-allocated buffers (avoid runtime allocation)
+    // Pre-allocated receive buffer
     unsigned char fInputBuffer[2048];
-    unsigned char fOutputBuffer[2048];
-    unsigned char fErrorBuffer[512];
 
 public:
     CircleOSCNetwork(CNetSubSystem* net);
@@ -163,22 +164,26 @@ public:
     // Initialization
     bool initialize(int inputPort, int outputPort, int errorPort);
 
-    // Phase 1: Input operations
+    // Input
     int receiveMessage(unsigned char** buffer, int maxLen,
                       CIPAddress* senderIP, unsigned short* senderPort);
 
-    // Phase 2: Output operations
+    // Output (send via single bound socket)
     bool sendToLastSender(const unsigned char* buffer, int len);
-    bool sendMessage(const unsigned char* buffer, int len,
-                    const CIPAddress& destIP, unsigned short destPort);
-
-    // Phase 3: Error reporting
     void sendError(const char* errorMsg);
 
     // Utilities
     bool hasValidSender() const { return fHasValidSender; }
-    unsigned char* getOutputBuffer() { return fOutputBuffer; }
-    int getOutputBufferSize() const { return sizeof(fOutputBuffer); }
+    void getDeviceIP(char* buf, int len) const {
+        if (fNet) {
+            const u8* ip = fNet->GetConfig()->GetIPAddress()->Get();
+            snprintf(buf, len, "%u.%u.%u.%u",
+                     (unsigned)ip[0], (unsigned)ip[1],
+                     (unsigned)ip[2], (unsigned)ip[3]);
+        } else {
+            snprintf(buf, len, "0.0.0.0");
+        }
+    }
 };
 
 //==============================================================================
@@ -203,7 +208,7 @@ private:
     // Timer for bargraph rate limiting (Phase 2)
     CTimer* fTimer;
     unsigned int fLastBargraphUpdate;
-    int fBargraphUpdateRateMs;                     // Milliseconds between updates
+    int fBargraphUpdateRateTicks;                  // Centi-seconds (GetTicks() units, HZ=100, 1 tick=10ms)
 
 public:
     OSCUI_circle(const char* appname, CNetSubSystem* net);
@@ -214,7 +219,7 @@ public:
     void setTimer(CTimer* timer) { fTimer = timer; }
 
     // Main processing (called from kernel loop)
-    void processOSC();
+    bool processOSC();
 
     // UI interface implementation (from faust/gui/UI.h)
     virtual void openTabBox(const char* label);
@@ -272,88 +277,54 @@ private:
 // CircleOSCNetwork Implementation
 //==============================================================================
 
+#include <circle/net/netsubsystem.h>
 #include <circle/net/socket.h>
 #include <circle/net/ipaddress.h>
 #include <circle/net/in.h>
+#include <cstdio>
 
 CircleOSCNetwork::CircleOSCNetwork(CNetSubSystem* net)
-    : fInputSocket(nullptr), fOutputSocket(nullptr), fErrorSocket(nullptr),
-      fNet(net), fHasValidSender(false), fLastSenderPort(0)
+    : fSocket(nullptr),
+      fNet(net), fOutputPort(5511), fErrPort(5512), fHasValidSender(false)
 {
 }
 
 CircleOSCNetwork::~CircleOSCNetwork()
 {
-    delete fInputSocket;
-    delete fOutputSocket;
-    delete fErrorSocket;
+    delete fSocket;
 }
 
 bool CircleOSCNetwork::initialize(int inputPort, int outputPort, int errorPort)
 {
     if (!fNet) return false;
 
-    // Create input socket (receive OSC messages)
-    fInputSocket = new CSocket(fNet, IPPROTO_UDP);
-    if (!fInputSocket) return false;
+    // Single socket: bind to inputPort so ReceiveFrom works AND SendTo works.
+    // Circle requires Bind() before SendTo() — unbound sockets return NOT_CONNECTED.
+    fSocket = new CSocket(fNet, IPPROTO_UDP);
+    if (!fSocket) return false;
 
-    if (fInputSocket->Bind(inputPort) < 0) {
-        delete fInputSocket;
-        fInputSocket = nullptr;
+    if (fSocket->Bind(inputPort) < 0) {
+        delete fSocket;
+        fSocket = nullptr;
         return false;
     }
 
-    // Create output socket (send bargraphs)
-    fOutputSocket = new CSocket(fNet, IPPROTO_UDP);
-    if (!fOutputSocket) {
-        delete fInputSocket;
-        fInputSocket = nullptr;
-        return false;
-    }
-
-    if (fOutputSocket->Bind(outputPort) < 0) {
-        delete fInputSocket;
-        delete fOutputSocket;
-        fInputSocket = nullptr;
-        fOutputSocket = nullptr;
-        return false;
-    }
-
-    // Create error socket
-    fErrorSocket = new CSocket(fNet, IPPROTO_UDP);
-    if (!fErrorSocket) {
-        delete fInputSocket;
-        delete fOutputSocket;
-        fInputSocket = nullptr;
-        fOutputSocket = nullptr;
-        return false;
-    }
-
-    if (fErrorSocket->Bind(errorPort) < 0) {
-        delete fInputSocket;
-        delete fOutputSocket;
-        delete fErrorSocket;
-        fInputSocket = nullptr;
-        fOutputSocket = nullptr;
-        fErrorSocket = nullptr;
-        return false;
-    }
-
+    fOutputPort = outputPort;
+    fErrPort = errorPort;
     return true;
 }
 
 int CircleOSCNetwork::receiveMessage(unsigned char** buffer, int maxLen,
                                      CIPAddress* senderIP, unsigned short* senderPort)
 {
-    if (!fInputSocket || maxLen > (int)sizeof(fInputBuffer)) return -1;
+    if (!fSocket || maxLen > (int)sizeof(fInputBuffer)) return -1;
 
-    int bytesReceived = fInputSocket->ReceiveFrom(fInputBuffer, maxLen,
-                                                  MSG_DONTWAIT, senderIP, senderPort);
+    int bytesReceived = fSocket->ReceiveFrom(fInputBuffer, maxLen,
+                                             MSG_DONTWAIT, senderIP, senderPort);
 
     if (bytesReceived > 0) {
-        // Track sender for responses
-        fLastSenderIP = *senderIP;
-        fLastSenderPort = *senderPort;
+        // First packet sets the destination host (Faust desthost model)
+        fDestHost = *senderIP;
         fHasValidSender = true;
         *buffer = fInputBuffer;
     }
@@ -363,29 +334,22 @@ int CircleOSCNetwork::receiveMessage(unsigned char** buffer, int maxLen,
 
 bool CircleOSCNetwork::sendToLastSender(const unsigned char* buffer, int len)
 {
-    if (!fOutputSocket || !fHasValidSender) return false;
-    return sendMessage(buffer, len, fLastSenderIP, fLastSenderPort);
-}
+    if (!fSocket || !fHasValidSender) return false;
 
-bool CircleOSCNetwork::sendMessage(const unsigned char* buffer, int len,
-                                   const CIPAddress& destIP, unsigned short destPort)
-{
-    if (!fOutputSocket) return false;
-
-    int sent = fOutputSocket->SendTo(buffer, len, MSG_DONTWAIT, destIP, destPort);
-    return (sent == len);
+    int sent = fSocket->SendTo(buffer, len, MSG_DONTWAIT, fDestHost, fOutputPort);
+    return (sent == (int)len);
 }
 
 void CircleOSCNetwork::sendError(const char* errorMsg)
 {
-    if (!fErrorSocket || !fHasValidSender || !errorMsg) return;
+    if (!fSocket || !fHasValidSender || !errorMsg) return;
 
     char buffer[512];
-    int len = tosc_writeMessage((unsigned char*)buffer, sizeof(buffer),
+    int len = tosc_writeMessage(buffer, sizeof(buffer),
                                "/error", "s", errorMsg);
 
     if (len > 0) {
-        fErrorSocket->SendTo(buffer, len, MSG_DONTWAIT, fLastSenderIP, fLastSenderPort);
+        fSocket->SendTo(buffer, len, MSG_DONTWAIT, fDestHost, fErrPort);
     }
 }
 
@@ -395,7 +359,7 @@ void CircleOSCNetwork::sendError(const char* errorMsg)
 
 OSCUI_circle::OSCUI_circle(const char* appname, CNetSubSystem* net)
     : fNetwork(nullptr), fNetworkReady(false), fRootName("/"), fTransmissionMode(1),
-      fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateMs(50)
+      fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateTicks(5)  // 5 ticks = 50ms
 {
     if (appname && appname[0] != '\0') {
         fRootName = std::string("/") + appname;
@@ -530,9 +494,9 @@ void OSCUI_circle::declare(FAUSTFLOAT* zone, const char* key, const char* val)
 // Main OSC Processing
 //==============================================================================
 
-void OSCUI_circle::processOSC()
+bool OSCUI_circle::processOSC()
 {
-    if (!fNetworkReady) return;
+    if (!fNetworkReady) return false;
 
     // Phase 1: Receive and process input messages
     unsigned char* buffer;
@@ -548,11 +512,13 @@ void OSCUI_circle::processOSC()
     // Phase 2: Send bargraph updates (rate-limited)
     if (fTransmissionMode != 0 && fTimer) {
         unsigned int now = getCurrentTime();
-        if ((now - fLastBargraphUpdate) >= (unsigned int)fBargraphUpdateRateMs) {
+        if ((now - fLastBargraphUpdate) >= (unsigned int)fBargraphUpdateRateTicks) {
             sendBargraphUpdates();
             fLastBargraphUpdate = now;
         }
     }
+
+    return (bytesReceived > 0);
 }
 
 void OSCUI_circle::parseAndRouteMessage(char* buffer, int len)
@@ -629,7 +595,7 @@ void OSCUI_circle::handleGetMessage()
 {
     // Send all parameter addresses with min/max
     const int MAX_BUNDLE_SIZE = 2048;
-    unsigned char* bundleBuffer = fNetwork->getOutputBuffer();
+    unsigned char bundleBuffer[MAX_BUNDLE_SIZE];
 
     tosc_bundle bundle;
     tosc_writeBundle(&bundle, TINYOSC_TIMETAG_IMMEDIATELY,
@@ -663,12 +629,15 @@ void OSCUI_circle::handleHelloMessage()
     // Send root address and port numbers
     unsigned char buffer[256];
 
-    int len = tosc_writeMessage(buffer, sizeof(buffer),
+    char ipStr[16];
+    fNetwork->getDeviceIP(ipStr, sizeof(ipStr));
+    int len = tosc_writeMessage((char*)buffer, sizeof(buffer),
                                fRootName.c_str(),
-                               "sii",
-                               "127.0.0.1",  // Could get actual IP from CNetSubSystem
+                               "siii",
+                               ipStr,
                                5510,
-                               5511);
+                               5511,
+                               5512);
 
     if (len > 0) {
         fNetwork->sendToLastSender(buffer, len);
@@ -680,7 +649,7 @@ void OSCUI_circle::sendBargraphUpdates()
     if (fBargraphs.empty()) return;
 
     const int MAX_BUNDLE_SIZE = 2048;
-    unsigned char* bundleBuffer = fNetwork->getOutputBuffer();
+    unsigned char bundleBuffer[MAX_BUNDLE_SIZE];
 
     tosc_bundle bundle;
     tosc_writeBundle(&bundle, TINYOSC_TIMETAG_IMMEDIATELY,

@@ -134,9 +134,9 @@ class circleFaustDSP
         //--------------------------------------------------------
         void setOSCTimer(CTimer* timer);
 
-        //-------`void processOSC()`--------
+        //-------`bool processOSC()`--------
         // Process incoming OSC messages (non-blocking).
-        // Call this regularly from main loop (e.g., every 1ms).
+        // Call this regularly from main loop, rate-limited to ~10ms intervals.
         // Never call from audio callback.
         //
         // Handles:
@@ -144,8 +144,14 @@ class circleFaustDSP
         // - OSC bundles
         // - Discovery messages (/get, /hello)
         // - Bargraph transmission (rate-limited)
+        //
+        // #### Returns
+        //
+        // true if a packet was received and processed (busy), false if idle.
+        // Use to drive Yield() — only yield when idle to avoid stacking
+        // network stack work on top of active I/O (important on single-core).
         //--------------------------------------------------------
-        void processOSC();
+        bool processOSC();
 
         //-------`int getOSCParamsCount()`--------
         // Get total number of OSC-controllable parameters.

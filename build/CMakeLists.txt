@@ -347,7 +347,7 @@ endif()
 ####################################
 set (ARCHDIR ${ROOT}/architecture)
 set (ARCHINC ${ARCHDIR}/faust)
-set (ARCHDIRS ${ARCHINC}/au ${ARCHINC}/audio ${ARCHINC}/dsp ${ARCHINC}/gui ${ARCHINC}/midi ${ARCHINC}/unity ${ARCHINC}/vst)
+set (ARCHDIRS ${ARCHINC}/au ${ARCHINC}/audio ${ARCHINC}/dsp ${ARCHINC}/gui ${ARCHINC}/midi ${ARCHINC}/osc ${ARCHINC}/unity ${ARCHINC}/vst)
 
 message (STATUS "Install location is ${CMAKE_INSTALL_PREFIX}")
 message (STATUS "Install libraries in ${CMAKE_INSTALL_PREFIX}/${LIBSDIR}")
