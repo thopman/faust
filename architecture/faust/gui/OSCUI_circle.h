@@ -174,16 +174,12 @@ public:
 
     // Utilities
     bool hasValidSender() const { return fHasValidSender; }
-    void getDeviceIP(char* buf, int len) const {
-        if (fNet) {
-            const u8* ip = fNet->GetConfig()->GetIPAddress()->Get();
-            snprintf(buf, len, "%u.%u.%u.%u",
-                     (unsigned)ip[0], (unsigned)ip[1],
-                     (unsigned)ip[2], (unsigned)ip[3]);
-        } else {
-            snprintf(buf, len, "0.0.0.0");
-        }
-    }
+    int getOutputPort() const { return fOutputPort; }
+    int getErrPort() const { return fErrPort; }
+    void getDeviceIP(char* buf, int len) const;
+    // The OSC "desthost": where replies are sent = the last sender (the client),
+    // NOT this device's own IP. "0.0.0.0" until a client has been heard.
+    void getLastSenderIP(char* buf, int len) const;
 };
 
 //==============================================================================
@@ -204,11 +200,20 @@ private:
     // Configuration
     std::string fRootName;                         // Root OSC address (e.g., "/faust")
     int fTransmissionMode;                         // 0=OFF, 1=ALL, 2=ALIAS (Phase 3)
+    std::string fJSONCache;                        // Cached JSONUI output, set via setJSON()
 
     // Timer for bargraph rate limiting (Phase 2)
     CTimer* fTimer;
     unsigned int fLastBargraphUpdate;
     int fBargraphUpdateRateTicks;                  // Centi-seconds (GetTicks() units, HZ=100, 1 tick=10ms)
+    unsigned int fLastClientRxTime;                // GetTicks() of last received client msg (gates keepalive)
+
+    // Key event hook (polyphony): "/keyon i i" and "/keyoff i" call this so
+    // notes can be played over OSC without MIDI hardware. Owner (circleFaustDSP)
+    // routes it to FaustPolyEngine::keyOn/keyOff; a no-op on non-poly DSPs.
+    typedef void (*key_handler_t)(void* arg, bool on, int pitch, int velocity);
+    key_handler_t fKeyHandler;
+    void* fKeyHandlerArg;
 
 public:
     OSCUI_circle(const char* appname, CNetSubSystem* net);
@@ -217,6 +222,8 @@ public:
     // Initialization
     bool initNetwork(int inputPort = 5510, int outputPort = 5511, int errorPort = 5512);
     void setTimer(CTimer* timer) { fTimer = timer; }
+    void setJSON(const std::string& json) { fJSONCache = json; }
+    void setKeyHandler(key_handler_t handler, void* arg) { fKeyHandler = handler; fKeyHandlerArg = arg; }
 
     // Main processing (called from kernel loop)
     bool processOSC();
@@ -264,7 +271,9 @@ private:
     // Phase 2: Discovery and output
     void handleGetMessage();
     void handleHelloMessage();
+    void handleUIGetMessage();
     void sendBargraphUpdates();
+    void sendKeepAlive();
 
     // Phase 3: Advanced features
     void handleXmitMessage(int mode);
@@ -292,6 +301,30 @@ CircleOSCNetwork::CircleOSCNetwork(CNetSubSystem* net)
 CircleOSCNetwork::~CircleOSCNetwork()
 {
     delete fSocket;
+}
+
+void CircleOSCNetwork::getDeviceIP(char* buf, int len) const
+{
+    if (fNet) {
+        const u8* ip = fNet->GetConfig()->GetIPAddress()->Get();
+        snprintf(buf, len, "%u.%u.%u.%u",
+                 (unsigned)ip[0], (unsigned)ip[1],
+                 (unsigned)ip[2], (unsigned)ip[3]);
+    } else {
+        snprintf(buf, len, "0.0.0.0");
+    }
+}
+
+void CircleOSCNetwork::getLastSenderIP(char* buf, int len) const
+{
+    if (fHasValidSender) {
+        const u8* ip = fDestHost.Get();
+        snprintf(buf, len, "%u.%u.%u.%u",
+                 (unsigned)ip[0], (unsigned)ip[1],
+                 (unsigned)ip[2], (unsigned)ip[3]);
+    } else {
+        snprintf(buf, len, "0.0.0.0");
+    }
 }
 
 bool CircleOSCNetwork::initialize(int inputPort, int outputPort, int errorPort)
@@ -359,7 +392,8 @@ void CircleOSCNetwork::sendError(const char* errorMsg)
 
 OSCUI_circle::OSCUI_circle(const char* appname, CNetSubSystem* net)
     : fNetwork(nullptr), fNetworkReady(false), fRootName("/"), fTransmissionMode(1),
-      fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateTicks(5)  // 5 ticks = 50ms
+      fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateTicks(5),  // 5 ticks = 50ms
+      fLastClientRxTime(0), fKeyHandler(nullptr), fKeyHandlerArg(nullptr)
 {
     if (appname && appname[0] != '\0') {
         fRootName = std::string("/") + appname;
@@ -509,11 +543,33 @@ bool OSCUI_circle::processOSC()
         parseAndRouteMessage((char*)buffer, bytesReceived);
     }
 
-    // Phase 2: Send bargraph updates (rate-limited)
-    if (fTransmissionMode != 0 && fTimer) {
+    // Periodic outgoing traffic (rate-limited). Runs in EVERY mode: the BCM4343
+    // WiFi TX path idles without a steady packet cadence, and lone replies
+    // (/get, /hello, /ui) then get dropped below the socket even though SendTo
+    // reports success. xmit only gates DATA: bargraphs when on, a tiny keepalive
+    // when off — so one-shot replies always reach the wire.
+    if (fTimer) {
         unsigned int now = getCurrentTime();
+
+        // Note when a client was last heard, to gate the keepalive below.
+        if (bytesReceived > 0) {
+            fLastClientRxTime = now;
+        }
+
         if ((now - fLastBargraphUpdate) >= (unsigned int)fBargraphUpdateRateTicks) {
-            sendBargraphUpdates();
+            if (fTransmissionMode != 0) {
+                sendBargraphUpdates();
+            } else {
+                // RX-gate: only keep the WiFi TX warm while a client is actually
+                // talking to us (heard within KEEPALIVE_GATE_TICKS). Otherwise we
+                // would heartbeat a departed client forever — which bounces back as
+                // an ICMP "port unreachable" flood once it closes its socket.
+                const unsigned int KEEPALIVE_GATE_TICKS = 1000;  // 10s @ HZ=100 (1 tick=10ms)
+                if (fNetwork->hasValidSender() &&
+                    (now - fLastClientRxTime) < KEEPALIVE_GATE_TICKS) {
+                    sendKeepAlive();
+                }
+            }
             fLastBargraphUpdate = now;
         }
     }
@@ -559,11 +615,52 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
         return;
     }
 
+    if (strcmp(address, "/ui") == 0 && format[0] == 's') {
+        const char* arg = tosc_getNextString(msg);
+        if (arg && strcmp(arg, "get") == 0) {
+            handleUIGetMessage();
+            return;
+        }
+    }
+
     // Phase 3: Handle /xmit
     if (strcmp(address, "/xmit") == 0 && format[0] == 'i') {
         int mode = tosc_getNextInt32(msg);
         handleXmitMessage(mode);
         return;
+    }
+
+    // Polyphony: "/keyon i i" (pitch, velocity) and "/keyoff i" (pitch) —
+    // play notes over OSC, no MIDI hardware needed
+    if (strcmp(address, "/keyon") == 0 && format[0] == 'i' && format[1] == 'i') {
+        int pitch = tosc_getNextInt32(msg);
+        int velocity = tosc_getNextInt32(msg);
+        if (fKeyHandler) fKeyHandler(fKeyHandlerArg, true, pitch, velocity);
+        return;
+    }
+    if (strcmp(address, "/keyoff") == 0 && format[0] == 'i') {
+        int pitch = tosc_getNextInt32(msg);
+        if (fKeyHandler) fKeyHandler(fKeyHandlerArg, false, pitch, 0);
+        return;
+    }
+
+    // Per-parameter query: /path s get → fff current min max
+    if (format[0] == 's') {
+        const char* arg = tosc_getNextString(msg);
+        if (arg && strcmp(arg, "get") == 0) {
+            auto it = fPathMap.find(address);
+            if (it != fPathMap.end()) {
+                OSCNode* node = it->second;
+                unsigned char buf[256];
+                int len = tosc_writeMessage((char*)buf, sizeof(buf),
+                                           address, "fff",
+                                           node->getValue(),
+                                           node->getMin(),
+                                           node->getMax());
+                if (len > 0) fNetwork->sendToLastSender(buf, len);
+            }
+            return;
+        }
     }
 
     // Parameter update
@@ -593,7 +690,29 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
 
 void OSCUI_circle::handleGetMessage()
 {
-    // Send all parameter addresses with min/max
+    // Metadata header lines (Faust OSC spec)
+    unsigned char hdr[256];
+    char destIP[16];
+    // "desthost" = where we send replies = the last sender (the client), not us.
+    fNetwork->getLastSenderIP(destIP, sizeof(destIP));
+
+    int len = tosc_writeMessage((char*)hdr, sizeof(hdr),
+        fRootName.c_str(), "si", "xmit", fTransmissionMode);
+    if (len > 0) fNetwork->sendToLastSender(hdr, len);
+
+    len = tosc_writeMessage((char*)hdr, sizeof(hdr),
+        fRootName.c_str(), "ss", "desthost", destIP);
+    if (len > 0) fNetwork->sendToLastSender(hdr, len);
+
+    len = tosc_writeMessage((char*)hdr, sizeof(hdr),
+        fRootName.c_str(), "si", "outport", fNetwork->getOutputPort());
+    if (len > 0) fNetwork->sendToLastSender(hdr, len);
+
+    len = tosc_writeMessage((char*)hdr, sizeof(hdr),
+        fRootName.c_str(), "si", "errport", fNetwork->getErrPort());
+    if (len > 0) fNetwork->sendToLastSender(hdr, len);
+
+    // Per-parameter: fff current min max
     const int MAX_BUNDLE_SIZE = 2048;
     unsigned char bundleBuffer[MAX_BUNDLE_SIZE];
 
@@ -604,21 +723,17 @@ void OSCUI_circle::handleGetMessage()
     int messageCount = 0;
     for (OSCNode* node : fNodes) {
         tosc_writeNextMessage(&bundle, node->getPath().c_str(),
-                             "ff", node->getMin(), node->getMax());
+                             "fff", node->getValue(), node->getMin(), node->getMax());
         messageCount++;
 
-        // Check if approaching buffer limit
         if (bundle.bundleLen > MAX_BUNDLE_SIZE - 128) {
-            // Send current bundle
             fNetwork->sendToLastSender(bundleBuffer, bundle.bundleLen);
-            // Start new bundle
             tosc_writeBundle(&bundle, TINYOSC_TIMETAG_IMMEDIATELY,
                            (char*)bundleBuffer, MAX_BUNDLE_SIZE);
             messageCount = 0;
         }
     }
 
-    // Send final bundle
     if (messageCount > 0) {
         fNetwork->sendToLastSender(bundleBuffer, bundle.bundleLen);
     }
@@ -631,6 +746,9 @@ void OSCUI_circle::handleHelloMessage()
 
     char ipStr[16];
     fNetwork->getDeviceIP(ipStr, sizeof(ipStr));
+    // TODO: wire ports to accessors when auto port-alloc lands (ROADMAP Phase 3).
+    // Requires storing fInputPort + getInputPort() so all three ports report the
+    // actual bound values, not these literals. Hardcoded is honest-by-default today.
     int len = tosc_writeMessage((char*)buffer, sizeof(buffer),
                                fRootName.c_str(),
                                "siii",
@@ -642,6 +760,18 @@ void OSCUI_circle::handleHelloMessage()
     if (len > 0) {
         fNetwork->sendToLastSender(buffer, len);
     }
+}
+
+void OSCUI_circle::handleUIGetMessage()
+{
+    if (fJSONCache.empty()) {
+        fNetwork->sendError("UI JSON not available");
+        return;
+    }
+    unsigned char buf[4096];
+    int len = tosc_writeMessage((char*)buf, sizeof(buf),
+                               "/ui", "s", fJSONCache.c_str());
+    if (len > 0) fNetwork->sendToLastSender(buf, len);
 }
 
 void OSCUI_circle::sendBargraphUpdates()
@@ -676,6 +806,20 @@ void OSCUI_circle::sendBargraphUpdates()
     if (messageCount > 0) {
         fNetwork->sendToLastSender(bundleBuffer, bundle.bundleLen);
     }
+}
+
+// Tiny heartbeat sent only when xmit==0, to keep the WiFi TX path from idling
+// (see processOSC). A real OSC client can use it as a liveness signal or ignore
+// the address. Skipped until a sender is known (nothing to keep warm before
+// first contact). Path: <root>/heartbeat, one int (always 1).
+void OSCUI_circle::sendKeepAlive()
+{
+    if (!fNetwork->hasValidSender()) return;
+
+    unsigned char buf[64];
+    std::string path = fRootName + "/heartbeat";
+    int len = tosc_writeMessage((char*)buf, sizeof(buf), path.c_str(), "i", 1);
+    if (len > 0) fNetwork->sendToLastSender(buf, len);
 }
 
 //==============================================================================

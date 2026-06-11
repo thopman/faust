@@ -56,6 +56,7 @@
 
 #ifdef OSCCTRL
 #include "faust/gui/OSCUI_circle.h"
+#include "faust/gui/JSONUI.h"
 #endif
 
 //**************************************************************
@@ -118,6 +119,17 @@ void circleFaustDSP::propagateMidi(int count, double time, int type, int channel
 
 #ifdef OSCCTRL
 
+// "/keyon i i" / "/keyoff i" → poly voice allocator (no-op on non-poly DSPs)
+static void oscKeyTrampoline(void* arg, bool on, int pitch, int velocity)
+{
+    FaustPolyEngine* engine = static_cast<FaustPolyEngine*>(arg);
+    if (on) {
+        engine->keyOn(pitch, velocity);
+    } else {
+        engine->keyOff(pitch);
+    }
+}
+
 void circleFaustDSP::setOSCNetwork(CNetSubSystem* net,
                                     int inputPort,
                                     int outputPort,
@@ -129,8 +141,18 @@ void circleFaustDSP::setOSCNetwork(CNetSubSystem* net,
 
         // Initialize network with standard OSC ports
         if (fOSCUI->initNetwork(inputPort, outputPort, errorPort)) {
-            // Build the UI - this registers all parameters with OSCUI
+            // Build the UI - registers all parameters with OSCUI
             fPolyEngine->buildUserInterface(fOSCUI);
+
+            // OSC note events → poly engine
+            fOSCUI->setKeyHandler(oscKeyTrampoline, fPolyEngine);
+
+            // Build and cache JSON UI description for /ui s get queries
+            {
+                JSONUI jsonUI;
+                fPolyEngine->buildUserInterface(&jsonUI);
+                fOSCUI->setJSON(jsonUI.JSON());
+            }
         } else {
             // Network initialization failed
             delete fOSCUI;
