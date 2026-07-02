@@ -227,6 +227,16 @@ private:
     PendingUpdate fPending[kMaxPendingUpdates];
     int fPendingCount;
 
+    // TRUE while routing a datagram that came from the current desthost.
+    // Reply-generating handlers (/get, /hello, /ui, param "s get", the
+    // unknown-address error) and telemetry config (/xmit) are gated on it:
+    // replies can only ever be sent TO the desthost, so generating them for
+    // another sender both misdirects them at the innocent desthost client
+    // (up to 16 error datagrams per drain = flood amplification) and lets a
+    // bystander flip the owner's xmit mode. Parameter writes and key events
+    // stay open to every sender.
+    bool fCurMsgFromDest;
+
     // Key event hook (polyphony): "/keyon i i" and "/keyoff i" call this so
     // notes can be played over OSC without MIDI hardware. Owner (circleFaustDSP)
     // routes it to FaustPolyEngine::keyOn/keyOff; a no-op on non-poly DSPs.
@@ -414,7 +424,7 @@ void CircleOSCNetwork::sendError(const char* errorMsg)
 OSCUI_circle::OSCUI_circle(const char* appname, CNetSubSystem* net)
     : fNetwork(nullptr), fNetworkReady(false), fRootName("/"), fTransmissionMode(1),
       fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateTicks(5),  // 5 ticks = 50ms
-      fLastClientRxTime(0), fPendingCount(0),
+      fLastClientRxTime(0), fPendingCount(0), fCurMsgFromDest(true),
       fKeyHandler(nullptr), fKeyHandlerArg(nullptr)
 {
     if (appname && appname[0] != '\0') {
@@ -591,6 +601,8 @@ bool OSCUI_circle::processOSC()
             fLastClientRxTime = now;
         }
 
+        // After a repoint this is always true; only bystander packets clear it.
+        fCurMsgFromDest = fNetwork->isFromDestHost(senderIP);
         parseAndRouteMessage((char*)buffer, bytesReceived);
     }
 
@@ -652,21 +664,24 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
 
     if (!address || !format) return;
 
-    // Handle special messages (Phase 2)
+    // Handle special messages (Phase 2). Reply-generating handlers and /xmit
+    // are desthost-only (see fCurMsgFromDest): a reply for another sender
+    // would be misdirected at the desthost client anyway, and a bystander
+    // must not flip the owner's telemetry mode.
     if (strcmp(address, "/get") == 0) {
-        handleGetMessage();
+        if (fCurMsgFromDest) handleGetMessage();
         return;
     }
 
     if (strcmp(address, "/hello") == 0) {
-        handleHelloMessage();
+        if (fCurMsgFromDest) handleHelloMessage();
         return;
     }
 
     if (strcmp(address, "/ui") == 0 && format[0] == 's') {
         const char* arg = tosc_getNextString(msg);
         if (arg && strcmp(arg, "get") == 0) {
-            handleUIGetMessage();
+            if (fCurMsgFromDest) handleUIGetMessage();
             return;
         }
     }
@@ -674,7 +689,7 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
     // Phase 3: Handle /xmit
     if (strcmp(address, "/xmit") == 0 && format[0] == 'i') {
         int mode = tosc_getNextInt32(msg);
-        handleXmitMessage(mode);
+        if (fCurMsgFromDest) handleXmitMessage(mode);
         return;
     }
 
@@ -692,10 +707,11 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
         return;
     }
 
-    // Per-parameter query: /path s get → fff current min max
+    // Per-parameter query: /path s get → fff current min max (desthost-only)
     if (format[0] == 's') {
         const char* arg = tosc_getNextString(msg);
         if (arg && strcmp(arg, "get") == 0) {
+            if (!fCurMsgFromDest) return;
             flushParamUpdates();   // reads must observe earlier writes in this drain
             auto it = fPathMap.find(address);
             if (it != fPathMap.end()) {
@@ -726,8 +742,10 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
         } else if (format[0] == 'd') {
             stashParamUpdate(node, (FAUSTFLOAT)tosc_getNextDouble(msg));
         }
-    } else {
-        // Unknown address - send error (Phase 3)
+    } else if (fCurMsgFromDest) {
+        // Unknown address - send error (Phase 3). Desthost-only: without the
+        // gate, a bystander flooding unknown addresses turns the box into an
+        // error-datagram amplifier aimed at the desthost client (16/drain).
         std::string error = "Unknown OSC address: ";
         error += address;
         fNetwork->sendError(error.c_str());
