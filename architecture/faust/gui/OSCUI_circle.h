@@ -174,6 +174,13 @@ public:
 
     // Utilities
     bool hasValidSender() const { return fHasValidSender; }
+    // Sticky-desthost support: receiveMessage() no longer re-points fDestHost
+    // itself — the policy (no sender yet / refresh / silence takeover) lives in
+    // OSCUI_circle::processOSC(), which calls setDestHost() when it applies.
+    // Inline is fine here: these only touch CIPAddress (included above), not
+    // fNet/fSocket (still incomplete types at this point).
+    void setDestHost(const CIPAddress& sender) { fDestHost = sender; fHasValidSender = true; }
+    bool isFromDestHost(const CIPAddress& sender) const { return fHasValidSender && fDestHost == sender; }
     int getOutputPort() const { return fOutputPort; }
     int getErrPort() const { return fErrPort; }
     void getDeviceIP(char* buf, int len) const;
@@ -206,7 +213,19 @@ private:
     CTimer* fTimer;
     unsigned int fLastBargraphUpdate;
     int fBargraphUpdateRateTicks;                  // Centi-seconds (GetTicks() units, HZ=100, 1 tick=10ms)
-    unsigned int fLastClientRxTime;                // GetTicks() of last received client msg (gates keepalive)
+    unsigned int fLastClientRxTime;                // GetTicks() of last msg from the DESTHOST client
+                                                   // (gates keepalive + desthost takeover)
+
+    // Bounded drain + coalescing: Circle's UDP RX queue is unbounded, so
+    // processOSC() drains up to kMaxDatagramsPerDrain datagrams per call and
+    // coalesces duplicate parameter addresses within one drain (last value
+    // wins) before writing the zones. Special messages are never coalesced.
+    static const int kMaxDatagramsPerDrain = 16;
+    static const int kMaxPendingUpdates = 32;      // > drain cap: bundles carry multiple msgs
+    static const unsigned int kClientSilenceTicks = 1000;  // 10s @ HZ=100 — client considered gone
+    struct PendingUpdate { OSCNode* node; FAUSTFLOAT value; };
+    PendingUpdate fPending[kMaxPendingUpdates];
+    int fPendingCount;
 
     // Key event hook (polyphony): "/keyon i i" and "/keyoff i" call this so
     // notes can be played over OSC without MIDI hardware. Owner (circleFaustDSP)
@@ -267,6 +286,8 @@ private:
                 FAUSTFLOAT min, FAUSTFLOAT max, bool isOutput = false);
     void parseAndRouteMessage(char* buffer, int len);
     void routeMessage(tosc_message* msg);
+    void stashParamUpdate(OSCNode* node, FAUSTFLOAT value);
+    void flushParamUpdates();
 
     // Phase 2: Discovery and output
     void handleGetMessage();
@@ -356,9 +377,9 @@ int CircleOSCNetwork::receiveMessage(unsigned char** buffer, int maxLen,
                                              MSG_DONTWAIT, senderIP, senderPort);
 
     if (bytesReceived > 0) {
-        // First packet sets the destination host (Faust desthost model)
-        fDestHost = *senderIP;
-        fHasValidSender = true;
+        // NOTE: fDestHost is deliberately NOT updated here — the sticky-desthost
+        // policy in OSCUI_circle::processOSC() decides when a sender becomes the
+        // reply destination (via setDestHost()).
         *buffer = fInputBuffer;
     }
 
@@ -393,7 +414,8 @@ void CircleOSCNetwork::sendError(const char* errorMsg)
 OSCUI_circle::OSCUI_circle(const char* appname, CNetSubSystem* net)
     : fNetwork(nullptr), fNetworkReady(false), fRootName("/"), fTransmissionMode(1),
       fTimer(nullptr), fLastBargraphUpdate(0), fBargraphUpdateRateTicks(5),  // 5 ticks = 50ms
-      fLastClientRxTime(0), fKeyHandler(nullptr), fKeyHandlerArg(nullptr)
+      fLastClientRxTime(0), fPendingCount(0),
+      fKeyHandler(nullptr), fKeyHandlerArg(nullptr)
 {
     if (appname && appname[0] != '\0') {
         fRootName = std::string("/") + appname;
@@ -532,16 +554,47 @@ bool OSCUI_circle::processOSC()
 {
     if (!fNetworkReady) return false;
 
-    // Phase 1: Receive and process input messages
+    // Bounded drain: Circle's UDP RX queue (CNetQueue) is unbounded — a flood
+    // at the input port grows the heap until bare-metal OOM if only one
+    // datagram is taken per pass. Drain up to kMaxDatagramsPerDrain datagrams
+    // per call, coalescing duplicate parameter addresses (last value wins).
+    // Return "busy" (the kernel loop skips Yield on true) only when the cap
+    // was hit, i.e. more datagrams may still be queued.
     unsigned char* buffer;
     CIPAddress senderIP;
     unsigned short senderPort;
 
-    int bytesReceived = fNetwork->receiveMessage(&buffer, 2048, &senderIP, &senderPort);
+    int datagrams = 0;
+    bool capHit = false;
+    fPendingCount = 0;
 
-    if (bytesReceived > 0) {
+    while (true) {
+        if (datagrams >= kMaxDatagramsPerDrain) {
+            capHit = true;
+            break;
+        }
+        int bytesReceived = fNetwork->receiveMessage(&buffer, 2048, &senderIP, &senderPort);
+        if (bytesReceived <= 0) break;
+        datagrams++;
+
+        // Sticky desthost: replies follow the ACTIVE client instead of the last
+        // arbitrary packet (any host could hijack the reply stream before).
+        // Re-point only when (a) no valid sender yet, (b) the packet comes from
+        // the current desthost (refresh), or (c) the current client has been
+        // silent > kClientSilenceTicks (takeover). Unsigned tick subtraction —
+        // wrap-around safe.
+        unsigned int now = getCurrentTime();
+        if (!fNetwork->hasValidSender()
+            || fNetwork->isFromDestHost(senderIP)
+            || (now - fLastClientRxTime) > kClientSilenceTicks) {
+            fNetwork->setDestHost(senderIP);
+            fLastClientRxTime = now;
+        }
+
         parseAndRouteMessage((char*)buffer, bytesReceived);
     }
+
+    flushParamUpdates();
 
     // Periodic outgoing traffic (rate-limited). Runs in EVERY mode: the BCM4343
     // WiFi TX path idles without a steady packet cadence, and lone replies
@@ -551,22 +604,17 @@ bool OSCUI_circle::processOSC()
     if (fTimer) {
         unsigned int now = getCurrentTime();
 
-        // Note when a client was last heard, to gate the keepalive below.
-        if (bytesReceived > 0) {
-            fLastClientRxTime = now;
-        }
-
         if ((now - fLastBargraphUpdate) >= (unsigned int)fBargraphUpdateRateTicks) {
             if (fTransmissionMode != 0) {
                 sendBargraphUpdates();
             } else {
-                // RX-gate: only keep the WiFi TX warm while a client is actually
-                // talking to us (heard within KEEPALIVE_GATE_TICKS). Otherwise we
-                // would heartbeat a departed client forever — which bounces back as
-                // an ICMP "port unreachable" flood once it closes its socket.
-                const unsigned int KEEPALIVE_GATE_TICKS = 1000;  // 10s @ HZ=100 (1 tick=10ms)
+                // RX-gate: only keep the WiFi TX warm while the desthost client
+                // is actually talking to us (heard within kClientSilenceTicks).
+                // Otherwise we would heartbeat a departed client forever — which
+                // bounces back as an ICMP "port unreachable" flood once it
+                // closes its socket.
                 if (fNetwork->hasValidSender() &&
-                    (now - fLastClientRxTime) < KEEPALIVE_GATE_TICKS) {
+                    (now - fLastClientRxTime) < kClientSilenceTicks) {
                     sendKeepAlive();
                 }
             }
@@ -574,7 +622,7 @@ bool OSCUI_circle::processOSC()
         }
     }
 
-    return (bytesReceived > 0);
+    return capHit;
 }
 
 void OSCUI_circle::parseAndRouteMessage(char* buffer, int len)
@@ -648,6 +696,7 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
     if (format[0] == 's') {
         const char* arg = tosc_getNextString(msg);
         if (arg && strcmp(arg, "get") == 0) {
+            flushParamUpdates();   // reads must observe earlier writes in this drain
             auto it = fPathMap.find(address);
             if (it != fPathMap.end()) {
                 OSCNode* node = it->second;
@@ -663,18 +712,19 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
         }
     }
 
-    // Parameter update
+    // Parameter update — coalesced within the current drain (last value wins);
+    // flushParamUpdates() in processOSC() writes the zones once per drain.
     auto it = fPathMap.find(address);
     if (it != fPathMap.end()) {
         OSCNode* node = it->second;
 
         // Extract value by type
         if (format[0] == 'f') {
-            node->update(tosc_getNextFloat(msg));
+            stashParamUpdate(node, tosc_getNextFloat(msg));
         } else if (format[0] == 'i') {
-            node->update((FAUSTFLOAT)tosc_getNextInt32(msg));
+            stashParamUpdate(node, (FAUSTFLOAT)tosc_getNextInt32(msg));
         } else if (format[0] == 'd') {
-            node->update((FAUSTFLOAT)tosc_getNextDouble(msg));
+            stashParamUpdate(node, (FAUSTFLOAT)tosc_getNextDouble(msg));
         }
     } else {
         // Unknown address - send error (Phase 3)
@@ -688,8 +738,42 @@ void OSCUI_circle::routeMessage(tosc_message* msg)
 // Phase 2: Discovery and Output
 //==============================================================================
 
+// Coalescing helpers — duplicate addresses within one drain collapse to the
+// last value, so a burst of N messages to the same parameter costs one zone
+// write instead of N. Special messages (/get, /hello, /ui, /xmit, /keyon,
+// /keyoff, "s get" queries) are handled immediately in routeMessage and never
+// coalesced — key events are edge-triggered and must not be dropped.
+void OSCUI_circle::stashParamUpdate(OSCNode* node, FAUSTFLOAT value)
+{
+    for (int i = 0; i < fPendingCount; i++) {
+        if (fPending[i].node == node) {
+            fPending[i].value = value;   // last value wins
+            return;
+        }
+    }
+    if (fPendingCount < kMaxPendingUpdates) {
+        fPending[fPendingCount].node = node;
+        fPending[fPendingCount].value = value;
+        fPendingCount++;
+    } else {
+        // Table full (bundle-heavy drain): apply directly. Still correct — a
+        // later message for the same node matched the loop above, so ordering
+        // across distinct nodes is the only thing lost, and that is irrelevant.
+        node->update(value);
+    }
+}
+
+void OSCUI_circle::flushParamUpdates()
+{
+    for (int i = 0; i < fPendingCount; i++) {
+        fPending[i].node->update(fPending[i].value);
+    }
+    fPendingCount = 0;
+}
+
 void OSCUI_circle::handleGetMessage()
 {
+    flushParamUpdates();   // /get reports current values — observe this drain's writes
     // Metadata header lines (Faust OSC spec)
     unsigned char hdr[256];
     char destIP[16];
