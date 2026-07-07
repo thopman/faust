@@ -40,6 +40,7 @@
  * - Parameter control via OSC messages (float/int/double types)
  * - Bargraph monitoring (output) - Phase 2
  * - OSC discovery protocol (/get, /hello) - Phase 2
+ * - UI JSON over OSC ("/ui s get" -> chunked "/ui iis <i> <n> <chunk>" reply)
  * - Bundle support with timetag handling
  * - Non-blocking operation, real-time safe
  *
@@ -864,16 +865,40 @@ void OSCUI_circle::handleHelloMessage()
     }
 }
 
+// Chunked /ui reply: "/ui iis <index> <total> <chunk>", index 0..total-1.
+// The old single-message form ("/ui s <json>") failed silently once the JSON
+// outgrew the 4096-byte tosc buffer, and datagrams above the 1500-byte MTU
+// depended on IP fragmentation even before that. 1024-byte chunks keep every
+// datagram comfortably under the MTU. Stateless burst - the client reassembles
+// by index and simply re-sends "/ui get" if a chunk is lost. A JSON that fits
+// in one chunk still goes out as "iis 0 1 <json>" so clients parse one format.
 void OSCUI_circle::handleUIGetMessage()
 {
     if (fJSONCache.empty()) {
         fNetwork->sendError("UI JSON not available");
         return;
     }
-    unsigned char buf[4096];
-    int len = tosc_writeMessage((char*)buf, sizeof(buf),
-                               "/ui", "s", fJSONCache.c_str());
-    if (len > 0) fNetwork->sendToLastSender(buf, len);
+    const size_t kChunkSize = 1024;
+    const size_t total = (fJSONCache.size() + kChunkSize - 1) / kChunkSize;
+    char chunk[kChunkSize + 1];
+    // tinyosc quirk: tosc_vwrite's 's' case copies at most (buflen - offset -
+    // strlen) bytes - the buffer SLACK, not the string length - and reports
+    // success either way. A string only survives intact when the buffer is at
+    // least header + 2*strlen, hence 2*kChunkSize here. The datagram on the
+    // wire is the returned message length (~kChunkSize + 60), not this buffer.
+    // (This same quirk silently truncated the old single-message /ui reply
+    // beyond ~2KB of JSON - it never worked for mid-size DSPs.)
+    unsigned char buf[2 * kChunkSize + 128];
+    for (size_t i = 0; i < total; i++) {
+        const size_t off = i * kChunkSize;
+        size_t n = fJSONCache.size() - off;
+        if (n > kChunkSize) n = kChunkSize;
+        memcpy(chunk, fJSONCache.data() + off, n);
+        chunk[n] = '\0';
+        int len = tosc_writeMessage((char*)buf, sizeof(buf),
+                                   "/ui", "iis", (int)i, (int)total, chunk);
+        if (len > 0) fNetwork->sendToLastSender(buf, len);
+    }
 }
 
 void OSCUI_circle::sendBargraphUpdates()
