@@ -65,9 +65,10 @@ class FaustPolyEngine {
             bool midi_sync = false;
             bool midi = false;
             int nvoices = 0;
+            PolyPolicy policy;
             fRunning = false;
-            
-            MidiMeta::analyse(mono_dsp, midi, midi_sync, nvoices);
+
+            MidiMeta::analyse(mono_dsp, midi, midi_sync, nvoices, policy);
             
             // Getting the UI JSON
             JSONUI jsonui1(mono_dsp->getNumInputs(), mono_dsp->getNumOutputs());
@@ -80,8 +81,8 @@ class FaustPolyEngine {
             fJSONMeta = jsonui1M.JSON();
             
             if (nvoices > 0) {
-                
-                fPolyDSP = new mydsp_poly(mono_dsp, nvoices, true);
+
+                fPolyDSP = new mydsp_poly(mono_dsp, nvoices, true, true, policy);
                 
             #if POLY2
                 fFinalDSP = new dsp_sequencer(fPolyDSP, new effect());
