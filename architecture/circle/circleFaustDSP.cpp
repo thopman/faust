@@ -171,7 +171,20 @@ void circleFaustDSP::setOSCTimer(CTimer* timer)
 bool circleFaustDSP::processOSC()
 {
     if (fOSCUI) {
-        return fOSCUI->processOSC();
+        bool busy = fOSCUI->processOSC();
+        // In poly mode the OSC UI writes the GROUPED master zone; the values
+        // only reach the sounding voices - and momentary callbacks like the
+        // Panic button only fire - inside GUI::updateAllGuis(). The MIDI path
+        // already calls it (FaustPolyEngine::propagateMidi); the OSC path did
+        // not, so an OSC parameter change (filter sweep, octave, ...) sat on
+        // the master and was inaudible until the next MIDI/key event flushed
+        // it - params appeared to update only on note-on, and Panic did
+        // nothing. Call it unconditionally every tick (the standard Faust
+        // periodic-refresh cadence): processOSC()'s return is a flood/busy
+        // flag (capHit), NOT "a message was handled", so it cannot gate this.
+        // Cheap (a few float copies per grouped param) and a no-op in mono.
+        GUI::updateAllGuis();
+        return busy;
     }
     return false;
 }
