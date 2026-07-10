@@ -767,7 +767,27 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
             targetSet();
             std::vector<NoteInfo>& target = fTargetScratch;
 
+            // Pitch-indexed membership maps turn the reconcile from
+            // O(voices * target) scans into O(voices + target) lookups.
+            // MIDI note numbers are 7-bit; an out-of-range pitch (possible via
+            // OSC) takes the equivalent linear path, so semantics are unchanged
+            // for any input.
+            unsigned char targetMap[128];
+            unsigned char soundingMap[128];
+            memset(targetMap, 0, sizeof(targetMap));
+            memset(soundingMap, 0, sizeof(soundingMap));
+            for (const NoteInfo& n : target) {
+                if ((unsigned)n.fPitch < 128u) targetMap[n.fPitch] = 1;
+            }
+            for (size_t i = 0; i < fVoiceTable.size(); i++) {
+                int p = soundingPitch(i);
+                if ((unsigned)p < 128u) soundingMap[p] = 1;
+            }
+
             auto inTarget = [&](int pitch) {
+                if ((unsigned)pitch < 128u) {
+                    return targetMap[pitch] != 0;
+                }
                 for (const NoteInfo& n : target) {
                     if (n.fPitch == pitch) {
                         return true;
@@ -776,6 +796,9 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 return false;
             };
             auto isSounding = [&](int pitch) {
+                if ((unsigned)pitch < 128u) {
+                    return soundingMap[pitch] != 0;
+                }
                 for (size_t i = 0; i < fVoiceTable.size(); i++) {
                     if (soundingPitch(i) == pitch) {
                         return true;
