@@ -1110,14 +1110,14 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
             if (!checkPolyphony()) {
                 return 0;
             }
-            // Maintain the held-note stack (a re-pressed pitch refreshes its order).
+            // Maintain the held-note stack (a re-pressed pitch refreshes its
+            // order). Held pitches are unique, so stop at the first hit.
             bool was_held = false;
-            for (auto it = fHeldNotes.begin(); it != fHeldNotes.end();) {
+            for (auto it = fHeldNotes.begin(); it != fHeldNotes.end(); ++it) {
                 if (it->fPitch == pitch) {
-                    it       = fHeldNotes.erase(it);
+                    fHeldNotes.erase(it);
                     was_held = true;
-                } else {
-                    ++it;
+                    break;
                 }
             }
             NoteInfo note = {pitch, velocity, ++fDate};
@@ -1146,14 +1146,14 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 return;
             }
             // Remove the released key from the stack, then reconcile: a still-held
-            // note may re-sound (note-priority fall-back).
+            // note may re-sound (note-priority fall-back). Held pitches are
+            // unique, so stop at the first hit.
             bool held = false;
-            for (auto it = fHeldNotes.begin(); it != fHeldNotes.end();) {
+            for (auto it = fHeldNotes.begin(); it != fHeldNotes.end(); ++it) {
                 if (it->fPitch == pitch) {
-                    it   = fHeldNotes.erase(it);
+                    fHeldNotes.erase(it);
                     held = true;
-                } else {
-                    ++it;
+                    break;
                 }
             }
             if (held) {
