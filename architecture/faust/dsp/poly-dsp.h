@@ -733,28 +733,35 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
         void targetSet()
         {
             std::vector<NoteInfo>& sel = fTargetScratch;
-            sel.assign(fHeldNotes.begin(), fHeldNotes.end());
-            if (int(sel.size()) > fMaxSounding) {
-                switch (fPolicy.priority) {
-                    case NotePriority::Low:
-                        std::sort(sel.begin(), sel.end(), [](const NoteInfo& a, const NoteInfo& b) {
-                            return a.fPitch < b.fPitch;
-                        });
-                        break;
-                    case NotePriority::High:
-                        std::sort(sel.begin(), sel.end(), [](const NoteInfo& a, const NoteInfo& b) {
-                            return a.fPitch > b.fPitch;
-                        });
-                        break;
-                    case NotePriority::Last:
-                    default:
-                        std::sort(sel.begin(), sel.end(), [](const NoteInfo& a, const NoteInfo& b) {
-                            return a.fDate > b.fDate;
-                        });
-                        break;
-                }
-                sel.resize(fMaxSounding);
+            if (int(fHeldNotes.size()) <= fMaxSounding) {
+                sel.assign(fHeldNotes.begin(), fHeldNotes.end());
+                return;
             }
+            if (fPolicy.priority == NotePriority::Last) {
+                // fHeldNotes is press-ordered (oldest first) with unique,
+                // monotonic dates: the date-descending sort of the newest
+                // fMaxSounding notes is simply the suffix, reversed - no sort.
+                sel.clear();
+                for (size_t i = fHeldNotes.size(); int(sel.size()) < fMaxSounding; ) {
+                    sel.push_back(fHeldNotes[--i]);
+                }
+                return;
+            }
+            sel.assign(fHeldNotes.begin(), fHeldNotes.end());
+            switch (fPolicy.priority) {
+                case NotePriority::Low:
+                    std::sort(sel.begin(), sel.end(), [](const NoteInfo& a, const NoteInfo& b) {
+                        return a.fPitch < b.fPitch;
+                    });
+                    break;
+                case NotePriority::High:
+                default:
+                    std::sort(sel.begin(), sel.end(), [](const NoteInfo& a, const NoteInfo& b) {
+                        return a.fPitch > b.fPitch;
+                    });
+                    break;
+            }
+            sel.resize(fMaxSounding);
         }
 
         // Reconcile the sounding voices with the target set (held notes selected by
