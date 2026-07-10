@@ -1111,11 +1111,30 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 return 0;
             }
             // Maintain the held-note stack (a re-pressed pitch refreshes its order).
+            bool was_held = false;
             for (auto it = fHeldNotes.begin(); it != fHeldNotes.end();) {
-                it = (it->fPitch == pitch) ? fHeldNotes.erase(it) : it + 1;
+                if (it->fPitch == pitch) {
+                    it       = fHeldNotes.erase(it);
+                    was_held = true;
+                } else {
+                    ++it;
+                }
             }
             NoteInfo note = {pitch, velocity, ++fDate};
             fHeldNotes.push_back(note);
+            // Fast path (the historical default case): in Poly voicing within the
+            // sounding budget, every held note is already sounding and the new
+            // pitch is not (all sounding pitches are held ones, and this pitch was
+            // not held), so the reconcile provably reduces to its 'added' branch
+            // for this one note - the stock allocation path. Anything else (mono/
+            // duo, overflow, re-press) takes the full reconcile.
+            if (fPolicy.voicing == Voicing::Poly && !was_held &&
+                int(fHeldNotes.size()) <= fMaxSounding) {
+                int v = getFreeVoice();
+                fVoiceTable[v]->keyOn(pitch, velocity,
+                                      fVoiceTable[v]->fCurNote == kLegatoVoice);
+                return fVoiceTable[v];
+            }
             updateVoices();
             int voice = getPlayingVoice(pitch);
             return (voice != kNoVoice) ? fVoiceTable[voice] : 0;
@@ -1138,6 +1157,19 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 }
             }
             if (held) {
+                // Fast path, mirror of keyOn's: in Poly voicing when nothing was
+                // displaced (held count including this key was within the sounding
+                // budget), no note can fall back in - the reconcile reduces to its
+                // 'dropped' branch: release the voice(s) sounding this pitch.
+                if (fPolicy.voicing == Voicing::Poly &&
+                    int(fHeldNotes.size()) + 1 <= fMaxSounding) {
+                    for (size_t i = 0; i < fVoiceTable.size(); i++) {
+                        if (soundingPitch(i) == pitch) {
+                            fVoiceTable[i]->keyOff();
+                        }
+                    }
+                    return;
+                }
                 updateVoices();
             }
         }
