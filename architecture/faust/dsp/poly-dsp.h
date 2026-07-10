@@ -565,6 +565,12 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
         int        fMaxSounding;  // Max simultaneously-sounding notes (mono=1, duo=2, poly=nvoices)
         std::vector<NoteInfo> fHeldNotes;  // Physically-held keys, oldest first
 
+        // Reusable scratch for targetSet()/updateVoices(), reserved once in the
+        // constructor: note events never allocate after construction (RT-safe).
+        std::vector<NoteInfo> fTargetScratch;
+        std::vector<int>      fDroppedScratch;
+        std::vector<NoteInfo> fAddedScratch;
+
         // Fade out the audio in the buffer
         void fadeOut(int count, FAUSTFLOAT** outBuffer)
         {
@@ -723,9 +729,11 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
         }
 
         // Select up to fMaxSounding held notes to sound, per the note-priority policy.
-        std::vector<NoteInfo> targetSet()
+        // Fills fTargetScratch (member scratch - no allocation).
+        void targetSet()
         {
-            std::vector<NoteInfo> sel = fHeldNotes;
+            std::vector<NoteInfo>& sel = fTargetScratch;
+            sel.assign(fHeldNotes.begin(), fHeldNotes.end());
             if (int(sel.size()) > fMaxSounding) {
                 switch (fPolicy.priority) {
                     case NotePriority::Low:
@@ -747,7 +755,6 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 }
                 sel.resize(fMaxSounding);
             }
-            return sel;
         }
 
         // Reconcile the sounding voices with the target set (held notes selected by
@@ -757,7 +764,8 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
         // instead of being released and re-attacked.
         void updateVoices()
         {
-            std::vector<NoteInfo> target = targetSet();
+            targetSet();
+            std::vector<NoteInfo>& target = fTargetScratch;
 
             auto inTarget = [&](int pitch) {
                 for (const NoteInfo& n : target) {
@@ -777,7 +785,8 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
             };
 
             // Voices actively sounding a note that is no longer wanted.
-            std::vector<int> dropped;
+            std::vector<int>& dropped = fDroppedScratch;
+            dropped.clear();
             for (size_t i = 0; i < fVoiceTable.size(); i++) {
                 int p = soundingPitch(i);
                 if (p >= 0 && !inTarget(p)) {
@@ -785,7 +794,8 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                 }
             }
             // Target notes not yet sounding.
-            std::vector<NoteInfo> added;
+            std::vector<NoteInfo>& added = fAddedScratch;
+            added.clear();
             for (const NoteInfo& n : target) {
                 if (!isSounding(n.fPitch)) {
                     added.push_back(n);
@@ -878,6 +888,13 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
                  break;
          }
          fMaxSounding = std::min(fMaxSounding, nvoices);
+
+         // Reserve for the worst legal case (all 128 MIDI keys held) so note
+         // events never allocate after construction.
+         fHeldNotes.reserve(128);
+         fTargetScratch.reserve(128);
+         fAddedScratch.reserve(128);
+         fDroppedScratch.reserve(nvoices);
 
          // Create voices
          assert(nvoices > 0);
