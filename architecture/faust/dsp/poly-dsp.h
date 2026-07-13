@@ -902,6 +902,7 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
          } else {
              bool midi = false, midi_sync = false;
              int  meta_nvoices = nvoices;
+             fPolicy.fDeclared = false;  // the metadata scan below re-engages it
              MidiMeta::analyse(dsp, midi, midi_sync, meta_nvoices, fPolicy);
          }
          // Derive the simultaneously-sounding budget from the voicing mode,
@@ -1110,6 +1111,14 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
             if (!checkPolyphony()) {
                 return 0;
             }
+            // No note-allocation options declared: run the verbatim historical
+            // path - no held-note tracking, no policy engine, no added cost.
+            if (!fPolicy.fDeclared) {
+                int voice = getFreeVoice();
+                fVoiceTable[voice]->keyOn(pitch, velocity,
+                                          fVoiceTable[voice]->fCurNote == kLegatoVoice);
+                return fVoiceTable[voice];
+            }
             // Maintain the held-note stack (a re-pressed pitch refreshes its
             // order). Held pitches are unique, so stop at the first hit.
             bool was_held = false;
@@ -1143,6 +1152,16 @@ class mydsp_poly : public dsp_voice_group, public dsp_poly {
         void keyOff(int channel, int pitch, int velocity = 127)
         {
             if (!checkPolyphony()) {
+                return;
+            }
+            // Historical path (see keyOn).
+            if (!fPolicy.fDeclared) {
+                int voice = getPlayingVoice(pitch);
+                if (voice != kNoVoice) {
+                    fVoiceTable[voice]->keyOff();
+                } else {
+                    fprintf(stderr, "Playing pitch = %d not found\n", pitch);
+                }
                 return;
             }
             // Remove the released key from the stack, then reconcile: a still-held
@@ -1314,6 +1333,10 @@ struct dsp_poly_factory : public dsp_factory {
             bool midi_sync = false;
             bool midi = false;
             int    meta_nvoices = nvoices;
+            // On the factory path the DSP's own metadata decides whether the
+            // policy engine engages; construct mydsp_poly directly with an
+            // explicit policy to force it programmatically.
+            policy.fDeclared = false;
             MidiMeta::analyse(dsp, midi, midi_sync, meta_nvoices, policy);
             if (nvoices == -1) {
                 nvoices = meta_nvoices;

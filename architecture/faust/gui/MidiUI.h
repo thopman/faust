@@ -79,6 +79,12 @@ struct PolyPolicy {
     TriggerMode  trigger  = TriggerMode::Multi;
     StealMode    steal    = StealMode::Oldest;
     Voicing      voicing  = Voicing::Poly;
+
+    // True when the policy engine is engaged. Programmatic construction opts in
+    // (you built a PolyPolicy, you asked for it); the metadata path sets it only
+    // when the DSP declares at least one of the options above, so programs that
+    // declare none run the verbatim historical note-allocation code.
+    bool fDeclared = true;
 };
 
 /**
@@ -150,6 +156,10 @@ struct MidiMeta : public Meta {
     // Parse the note-allocation policy tokens from an already-extracted options map.
     static void parsePolicy(std::map<std::string, std::string>& md, PolyPolicy& policy)
     {
+        if (md.count("voicing") || md.count("note_priority") || md.count("trigger")
+            || md.count("steal")) {
+            policy.fDeclared = true;
+        }
         auto it = md.find("voicing");
         if (it != md.end()) {
             if (it->second == "mono") {
